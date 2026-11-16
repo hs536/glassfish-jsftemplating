@@ -20,32 +20,66 @@ import jakarta.el.ELClass;
 import jakarta.el.ELContext;
 import jakarta.el.ELResolver;
 
-import java.util.Objects;
+import java.lang.reflect.AccessibleObject;
+import java.lang.reflect.Member;
+import java.util.Set;
 
 /**
- * This {@link ELResolver} exists to restrict access to the next
- * EL expressions:
+ * {@link ELResolver} that blocks EL from reaching the Java runtime facilities
+ * usable for sandbox escape / RCE (GlassFish #707).
  *
- * <ul>
- *     <li>Static method calls</li>
- *     <li>Constructor calls</li>
- *     <li>The {@code getClass() instance method calls}</li>
- *     <li>The {@code class} instance property</li>
- *     <li>Static fields</li>
- * </ul>
+ * <p>Denies, across value- and method-expressions: static/constructor access
+ * via {@link ELClass}; any operation on a sensitive base ({@link Class},
+ * {@link ClassLoader}, {@code java.lang.reflect} members, {@link Runtime},
+ * {@link Process}, {@link ProcessBuilder}, {@link Thread}); and the accessors
+ * that hand such an object out from a benign base ({@code getClass},
+ * {@code getClassLoader}, the {@code class}/{@code classLoader} properties).
+ * The type guard is the backstop: once a sensitive object is held every
+ * further hop off it is denied, so the name list only needs the pivots that
+ * start from a benign base. Benign bean/handler navigation is left unresolved
+ * for the rest of the chain.
  *
  * @author avpinchuk
  */
 public class RestrictedELResolver extends ELResolver {
 
+    // Sensitive base types; isInstance() so subtypes/impls are covered.
+    private static final Set<Class<?>> DISALLOWED_BASE_TYPES = Set.of(
+            Class.class, ClassLoader.class,
+            AccessibleObject.class, Member.class,   // Method, Field, Constructor
+            Runtime.class, Process.class, ProcessBuilder.class, Thread.class);
+
+    // Accessors that hand out a sensitive object from an otherwise benign base.
+    private static final Set<String> DISALLOWED_METHODS = Set.of(
+            "getClass", "getClassLoader", "getContextClassLoader",
+            "loadClass", "forName", "getRuntime", "exec");
+
+    private static final Set<String> DISALLOWED_PROPERTIES = Set.of(
+            "class", "classLoader", "contextClassLoader");
+
+    private static boolean isDisallowedBase(Object base) {
+        if (base instanceof ELClass) {
+            return true;
+        }
+        for (Class<?> type : DISALLOWED_BASE_TYPES) {
+            if (type.isInstance(base)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean deniesProperty(Object base, Object property) {
+        return isDisallowedBase(base)
+                || (property != null && DISALLOWED_PROPERTIES.contains(property.toString()));
+    }
+
     @Override
     public Object getValue(ELContext elContext, Object base, Object property) {
-        // Go to the next resolver in chain
         if (base == null) {
             return null;
         }
-        // Disable static fields and 'class' instance property
-        if (base instanceof ELClass || Objects.equals(property, "class")) {
+        if (deniesProperty(base, property)) {
             elContext.setPropertyResolved(true);
             throw new PropertyNotAllowedException();
         }
@@ -54,12 +88,11 @@ public class RestrictedELResolver extends ELResolver {
 
     @Override
     public Object invoke(ELContext elContext, Object base, Object method, Class<?>[] paramTypes, Object[] params) {
-        // Go to the next resolver in chain
         if (base == null) {
             return null;
         }
-        // Disable static methods, constructors and 'getClass()' method
-        if (base instanceof ELClass || Objects.equals(method, "getClass")) {
+        if (isDisallowedBase(base)
+                || (method != null && DISALLOWED_METHODS.contains(method.toString()))) {
             elContext.setPropertyResolved(true);
             throw new MethodNotAllowedException();
         }
@@ -68,12 +101,22 @@ public class RestrictedELResolver extends ELResolver {
 
     @Override
     public Class<?> getType(ELContext elContext, Object base, Object property) {
+        if (base == null) {
+            return null;
+        }
+        if (deniesProperty(base, property)) {
+            elContext.setPropertyResolved(true);
+            throw new PropertyNotAllowedException();
+        }
         return null;
     }
 
     @Override
     public void setValue(ELContext elContext, Object base, Object property, Object value) {
-        // Do nothing
+        if (base != null && deniesProperty(base, property)) {
+            elContext.setPropertyResolved(true);
+            throw new PropertyNotAllowedException();
+        }
     }
 
     @Override
